@@ -173,6 +173,34 @@ mcpServers:
 **返回：** 包含内联图片（ImageContent）和元信息（TextContent）的内容列表。
 元信息包含 `seed`、`model`、`batch_size`。
 
+### `img2img`（自拍/角色保持）
+
+基于参考图生成图片，适合自拍、换装、保持角色一致的场景。
+
+**参数：**
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `prompt` | `string` | **必填** | 描述画面（穿什么、在哪、姿势等） |
+| `reference_path` | `string` | `""` | 服务器上参考图的路径。不传则用默认参考图 |
+| `reference_base64` | `string` | `""` | 参考图 base64 数据。优先级高于 reference_path |
+| `negative_prompt` | `string` | 内置 PonyXL 负面词 | 反向提示词 |
+| `denoising_strength` | `float` | `0.5` | 去噪强度。0.1=微调细节，0.5=适度变化，0.8=大变身 |
+| `steps` | `int` | `25` | 采样步数 (15-40) |
+| `width` | `int` | `832` | 图片宽度（像素） |
+| `height` | `int` | `1216` | 图片高度（像素） |
+| `cfg_scale` | `float` | `7.0` | CFG 引导强度 (4-15) |
+| `sampler_name` | `string` | `Euler a` | 采样器名称 |
+| `seed` | `int` | `-1` | 随机种子 |
+| `batch_size` | `int` | `1` | 一次生成几张 |
+
+**参考图优先级：**
+1. `reference_base64`（客户端直接传图）
+2. `reference_path`（服务器本地路径）
+3. 都不传 → 使用 `SD_REFERENCE_IMAGE` 环境变量指定的默认图
+
+**返回：** 同 `txt2img`，内联图片 + 元信息（含 `seed`、`model`、`denoising_strength`）。
+
 ### `get_sd_status`
 
 检查 SD WebUI 是否在线，并返回当前加载的模型信息。
@@ -182,7 +210,9 @@ mcpServers:
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `SD_WEBUI_URL` | `http://127.0.0.1:7860` | SD WebUI 的访问地址。远程时改为 `http://<IP>:<port>` |
-| `SD_OUTPUT_DIR` | `/tmp/sd-output` | 图片同时保存到本地的目录（内联返回已包含图片，此目录仅供本地手动取用） |
+| `SD_OUTPUT_DIR` | `/tmp/sd-output` | txt2img 图片本地保存目录 |
+| `SELFIE_OUTPUT_DIR` | `/tmp/sd-selfie-output` | img2img 图片本地保存目录 |
+| `SD_REFERENCE_IMAGE` | `~/.openclaw/skills/sd-selfie/assets/reference.png` | 默认参考图路径 |
 | `SD_VRAM_MANAGEMENT` | `1` (开) | 设为 `0` 关闭 VRAM 自动管理。如果没有 `llama-server` 强烈建议关闭 |
 | `LLAMA_SERVICE` | `llama-server.service` | `systemctl --user` 管理的 llama-server 服务名 |
 | `LLAMA_HEALTH_URL` | `http://127.0.0.1:5500/health` | llama-server 健康检查接口地址 |
@@ -221,13 +251,35 @@ SD_VRAM_MANAGEMENT=0 \
 ## 调用示例
 
 ```python
-# 在支持 MCP 的客户端中调用 txt2img
+# txt2img — 纯文本生图
 result = client.call_tool("txt2img", {
     "prompt": "(score_9, score_8_up, score_7_up), masterpiece, best quality, 1girl, cat ears, green hair, pink eyes, cute catgirl, nekomimi, looking at viewer, smile",
     "steps": 25,
     "width": 832,
     "height": 1216,
     "seed": 42
+})
+```
+
+```python
+# img2img — 基于参考图生成（自拍/换装）
+result = client.call_tool("img2img", {
+    "prompt": "穿着红色连衣裙，在咖啡厅",
+    "reference_path": "/home/user/my_photo.png",
+    "denoising_strength": 0.5,
+    "steps": 25,
+    "width": 832,
+    "height": 1216,
+    "seed": 123
+})
+```
+
+```python
+# img2img — 传 base64（客户端直接上传图片）
+result = client.call_tool("img2img", {
+    "prompt": "泳装，海滩，阳光",
+    "reference_base64": "iVBORw0KGgoAAAANSUhEUg...",  # base64 编码的图片数据
+    "denoising_strength": 0.7,
 })
 ```
 

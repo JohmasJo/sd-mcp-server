@@ -42,6 +42,11 @@ from mcp.types import TextContent
 
 SD_URL = os.environ.get("SD_WEBUI_URL", "http://127.0.0.1:7860")
 OUTPUT_DIR = Path(os.environ.get("SD_OUTPUT_DIR", "/tmp/sd-output"))
+SELFIE_OUTPUT_DIR = Path(os.environ.get("SELFIE_OUTPUT_DIR", "/tmp/sd-selfie-output"))
+DEFAULT_REFERENCE = os.environ.get(
+    "SD_REFERENCE_IMAGE",
+    os.path.expanduser("~/.openclaw/skills/sd-selfie/assets/reference.png")
+)
 LLAMA_SERVICE = os.environ.get("LLAMA_SERVICE", "llama-server.service")
 LLAMA_HEALTH_URL = os.environ.get("LLAMA_HEALTH_URL", "http://127.0.0.1:5500/health")
 VRAM_MANAGEMENT = os.environ.get("SD_VRAM_MANAGEMENT", "1") == "1"
@@ -103,6 +108,58 @@ def start_llm() -> None:
 # ─── SD API ────────────────────────────────────────────────────────────────────
 
 
+def _sd_request(endpoint: str, payload: dict) -> dict:
+    """通用 SD WebUI API 请求"""
+    url = f"{SD_URL}/{endpoint}"
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"SD WebUI HTTP {e.code}: {e.reason}\n{e.read().decode()}")
+    except Exception as e:
+        raise RuntimeError(f"SD WebUI connection failed: {e}")
+
+
+def _save_images(raw_images: list[bytes], info: dict, output_dir: Path) -> dict:
+    """将原始图片数据保存到磁盘并返回结果字典"""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    paths: list[str] = []
+    seed_val = info.get("seed", "unknown")
+    ts = time.strftime("%H%M%S")
+    for i, img_data in enumerate(raw_images):
+        filename = f"{ts}_{seed_val}_{i}.png"
+        filepath = output_dir / filename
+        filepath.write_bytes(img_data)
+        paths.append(str(filepath.resolve()))
+    return {
+        "images": raw_images,
+        "paths": paths,
+        "seed": info.get("seed", -1),
+        "model": info.get("sd_model_name", ""),
+        "info": info,
+    }
+
+
+def _build_response(result: dict, extra_meta: dict | None = None) -> list:
+    """构建 MCP 响应：内联图片 + 元信息文本"""
+    content: list = []
+    for img_data in result["images"]:
+        content.append(Image(data=img_data, format="png"))
+    meta = {"seed": result["seed"], "model": result["model"]}
+    if extra_meta:
+        meta.update(extra_meta)
+    content.append(TextContent(
+        type="text",
+        text=json.dumps(meta, indent=2, ensure_ascii=False),
+    ))
+    return content
+
+
 def call_txt2img(
     prompt: str,
     negative_prompt: str = (
@@ -133,44 +190,56 @@ def call_txt2img(
         "batch_size": batch_size,
     }
 
-    url = f"{SD_URL}/sdapi/v1/txt2img"
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"SD WebUI HTTP {e.code}: {e.reason}\n{e.read().decode()}")
-    except Exception as e:
-        raise RuntimeError(f"SD WebUI connection failed: {e}")
-
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    raw_images: list[bytes] = []
-    paths: list[str] = []
+    result = _sd_request("sdapi/v1/txt2img", payload)
     info = json.loads(result.get("info", "{}"))
+    raw_images = [base64.b64decode(img) for img in result.get("images", [])]
 
-    for i, img_b64 in enumerate(result.get("images", [])):
-        img_data = base64.b64decode(img_b64)
-        raw_images.append(img_data)
-        # 同时存到磁盘，方便本地取用
-        seed_val = info.get("seed", "unknown")
-        filename = f"{seed_val}_{i}.png"
-        filepath = OUTPUT_DIR / filename
-        filepath.write_bytes(img_data)
-        paths.append(str(filepath.resolve()))
+    return _save_images(raw_images, info, OUTPUT_DIR)
 
-    return {
-        "images": raw_images,
-        "paths": paths,
-        "seed": info.get("seed", -1),
-        "model": info.get("sd_model_name", ""),
-        "info": info,
+
+def call_img2img(
+    prompt: str,
+    init_image_b64: str,
+    negative_prompt: str = (
+        "(score_4,score_3,score_2,score_1),worst quality,bad hands,bad feet,"
+        "lowres,bad anatomy,bad hands,text,error,missing fingers,extra digit,"
+        "fewer digits,cropped,worst quality,low quality,normal quality,jpeg "
+        "artifacts,signature,watermark,username,blurry"
+    ),
+    denoising_strength: float = 0.5,
+    steps: int = 25,
+    width: int = 832,
+    height: int = 1216,
+    cfg_scale: float = 7.0,
+    sampler_name: str = "Euler a",
+    seed: int = -1,
+    batch_size: int = 1,
+) -> dict:
+    """调用 SD WebUI img2img API（基于参考图生成），返回结果"""
+
+    # 自动补 PonyXL 质量前缀（如果 prompt 没有自带）
+    prompt_prefix = "(score_9, score_8_up, score_7_up), masterpiece, best quality,"
+    full_prompt = f"{prompt_prefix} {prompt}" if not prompt.startswith("(score") else prompt
+
+    payload = {
+        "init_images": [init_image_b64],
+        "prompt": full_prompt,
+        "negative_prompt": negative_prompt,
+        "denoising_strength": denoising_strength,
+        "steps": steps,
+        "width": width,
+        "height": height,
+        "cfg_scale": cfg_scale,
+        "sampler_name": sampler_name,
+        "seed": seed,
+        "batch_size": batch_size,
     }
+
+    result = _sd_request("sdapi/v1/img2img", payload)
+    info = json.loads(result.get("info", "{}"))
+    raw_images = [base64.b64decode(img) for img in result.get("images", [])]
+
+    return _save_images(raw_images, info, SELFIE_OUTPUT_DIR)
 
 
 # ─── FastMCP Tools ─────────────────────────────────────────────────────────────
@@ -232,21 +301,97 @@ def txt2img_tool(
         if VRAM_MANAGEMENT:
             start_llm()
 
-    # 构建返回内容：图片 + 元信息
-    content: list = []
-    for img_data in result["images"]:
-        content.append(Image(data=img_data, format="png"))
+    return _build_response(result, {"batch_size": batch_size})
 
-    content.append(TextContent(
-        type="text",
-        text=json.dumps({
-            "seed": result["seed"],
-            "model": result["model"],
-            "batch_size": batch_size,
-        }, indent=2, ensure_ascii=False),
-    ))
 
-    return content
+@mcp.tool(
+    name="img2img",
+    description="基于参考图生成图片（自拍/角色保持），上传 base64 图片或使用本地路径",
+)
+def img2img_tool(
+    prompt: str = ...,
+    reference_path: str = "",
+    reference_base64: str = "",
+    negative_prompt: str = (
+        "(score_4,score_3,score_2,score_1),worst quality,bad hands,bad feet,"
+        "lowres,bad anatomy,bad hands,text,error,missing fingers,extra digit,"
+        "fewer digits,cropped,worst quality,low quality,normal quality,jpeg "
+        "artifacts,signature,watermark,username,blurry"
+    ),
+    denoising_strength: float = 0.5,
+    steps: int = 25,
+    width: int = 832,
+    height: int = 1216,
+    cfg_scale: float = 7.0,
+    sampler_name: str = "Euler a",
+    seed: int = -1,
+    batch_size: int = 1,
+) -> list:
+    """
+    基于参考图（自拍/角色保持）生成图片，返回内联图片内容。
+
+    参考图三种提供方式（按优先级）：
+      1. reference_base64 — 直接传 base64 编码的图片数据
+      2. reference_path — 指定服务器上的图片文件路径
+      3. 都不传 — 使用 SD_REFERENCE_IMAGE 环境变量指定的默认参考图
+
+    Args:
+        prompt: 描述画面（穿什么、在哪里、姿势等）
+        reference_path: 服务器上参考图的文件路径
+        reference_base64: 参考图的 base64 编码数据
+        negative_prompt: 反向提示词
+        denoising_strength: 去噪强度，0.1=微调细节，0.8=大变身 (0.1-0.8)
+        steps: 采样步数 (15-40)
+        width: 图片宽度 (像素)
+        height: 图片高度 (像素)
+        cfg_scale: CFG 引导强度 (4-15)
+        sampler_name: 采样器名称
+        seed: 随机种子，-1 为随机
+        batch_size: 一次生成几张
+
+    Returns:
+        列表，包含内联图片 (Image) 和元信息 (TextContent)
+    """
+    # 确定参考图 base64
+    if reference_base64:
+        init_b64 = reference_base64
+    elif reference_path:
+        ref_path = os.path.expanduser(reference_path)
+        if not os.path.exists(ref_path):
+            raise RuntimeError(f"Reference image not found: {ref_path}")
+        with open(ref_path, "rb") as f:
+            init_b64 = base64.b64encode(f.read()).decode("utf-8")
+    else:
+        if not os.path.exists(DEFAULT_REFERENCE):
+            raise RuntimeError(
+                f"No reference image provided and default not found: {DEFAULT_REFERENCE}. "
+                "Provide reference_path or reference_base64, or set SD_REFERENCE_IMAGE env var."
+            )
+        with open(DEFAULT_REFERENCE, "rb") as f:
+            init_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+    if VRAM_MANAGEMENT:
+        stop_llm()
+
+    try:
+        result = call_img2img(
+            prompt=prompt,
+            init_image_b64=init_b64,
+            negative_prompt=negative_prompt,
+            denoising_strength=denoising_strength,
+            steps=steps,
+            width=width,
+            height=height,
+            cfg_scale=cfg_scale,
+            sampler_name=sampler_name,
+            seed=seed,
+            batch_size=batch_size,
+        )
+    finally:
+        if VRAM_MANAGEMENT:
+            start_llm()
+
+    return _build_response(result, {"batch_size": batch_size, "denoising_strength": denoising_strength})
 
 
 @mcp.tool(
